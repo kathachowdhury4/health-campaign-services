@@ -135,6 +135,7 @@ async function runWithinRequestBudget<T>(
 
     let timeoutHandle: NodeJS.Timeout | null = null;
     // This bounds caller wait-time; it does not abort the underlying operation unless the downstream client supports cancellation.
+    // Retries therefore must remain idempotent and tolerate late completion of timed-out downstream calls.
     const timeoutPromise = new Promise<T>((_resolve, reject) => {
         timeoutHandle = setTimeout(() => reject(createRequestTimeoutError(operationName)), remainingTimeMs);
     });

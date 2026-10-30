@@ -421,6 +421,25 @@ describe("downloadDataService always-fresh behavior", () => {
         }
     });
 
+    it("deterministically times out a never-resolving generation using fake timers", async () => {
+        jest.useFakeTimers();
+        jest.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockImplementation(() => new Promise(() => { }));
+
+        try {
+            const promise = downloadDataService(buildRequest());
+            const timeoutExpectation = expect(promise).rejects.toMatchObject({
+                status: 504,
+                code: "REQUEST_TIMEOUT",
+            });
+            await jest.advanceTimersByTimeAsync(45000);
+            await timeoutExpectation;
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
     it("throws request-timeout when request budget is already exhausted before validation", async () => {
         const dateNowSpy = jest.spyOn(Date, "now");
         try {
@@ -538,6 +557,7 @@ describe("downloadDataService always-fresh behavior", () => {
 
             const result = await downloadDataService(buildRequest());
 
+            expect(mockSearchGeneratedResources).toHaveBeenCalledTimes(1);
             expect(result).toEqual([NEW_RESOURCE]);
         } finally {
             dateNowSpy.mockRestore();
@@ -561,6 +581,16 @@ describe("downloadDataService always-fresh behavior", () => {
         expect(mockGenerateTemplateDataService).not.toHaveBeenCalled();
         expect(mockCallGenerate).not.toHaveBeenCalled();
         expect(result).toEqual([explicit]);
+    });
+
+    it("returns empty list when explicit generated resource id is not found", async () => {
+        mockSearchGeneratedResources.mockResolvedValue([]);
+
+        const result = await downloadDataService(buildRequest({ query: { id: "missing-id" } }));
+
+        expect(result).toEqual([]);
+        expect(mockGenerateTemplateDataService).not.toHaveBeenCalled();
+        expect(mockCallGenerate).not.toHaveBeenCalled();
     });
 
     it("merges resource additionalDetails when explicit id is requested", async () => {
