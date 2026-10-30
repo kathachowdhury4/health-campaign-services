@@ -96,12 +96,17 @@ import { searchGeneratedResources, searchAllGeneratedResources } from "../utils/
 import { validateDownloadRequest } from "../validators/campaignValidators";
 import { generateDataService as generateTemplateDataService } from "../service/sheetManageService";
 import { callGenerate } from "../utils/generateUtils";
+import { getResourceDetails, isCampaignIdOfMicroplan } from "../utils/campaignUtils";
+import { logger } from "../utils/logger";
 
 const mockSearchGeneratedResources = searchGeneratedResources as jest.Mock;
 const mockSearchAllGeneratedResources = searchAllGeneratedResources as jest.Mock;
 const mockValidateDownloadRequest = validateDownloadRequest as jest.Mock;
 const mockGenerateTemplateDataService = generateTemplateDataService as jest.Mock;
 const mockCallGenerate = callGenerate as jest.Mock;
+const mockGetResourceDetails = getResourceDetails as jest.Mock;
+const mockIsCampaignIdOfMicroplan = isCampaignIdOfMicroplan as jest.Mock;
+const mockLoggerWarn = logger.warn as jest.Mock;
 
 const OLD_RESOURCE = {
     id: "old-gen-id",
@@ -154,6 +159,8 @@ describe("downloadDataService always-fresh behavior", () => {
     beforeEach(() => {
         jest.clearAllMocks();
         mockValidateDownloadRequest.mockResolvedValue(undefined);
+        mockGetResourceDetails.mockResolvedValue(null);
+        mockIsCampaignIdOfMicroplan.mockResolvedValue(false);
         mockConfig.generatedResource.reuseWindowMs = 30000;
         mockSearchAllGeneratedResources.mockResolvedValue([]);
     });
@@ -180,6 +187,19 @@ describe("downloadDataService always-fresh behavior", () => {
         );
         expect(result).toEqual([COMPLETED_NEW_RESOURCE]);
         expect(mockCallGenerate).not.toHaveBeenCalled();
+    });
+
+    it("invokes validation and key lookups only once in fresh-generation path", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        mockSearchGeneratedResources.mockResolvedValue([COMPLETED_NEW_RESOURCE]);
+
+        await downloadDataService(buildRequest());
+
+        expect(mockValidateDownloadRequest).toHaveBeenCalledTimes(1);
+        expect(mockGetResourceDetails).toHaveBeenCalledTimes(1);
+        expect(mockSearchAllGeneratedResources).toHaveBeenCalledTimes(1);
+        expect(mockGenerateTemplateDataService).toHaveBeenCalledTimes(1);
     });
 
     it("does not regenerate when explicit generated resource id is provided", async () => {
@@ -359,5 +379,345 @@ describe("downloadDataService always-fresh behavior", () => {
 
         expect(mockGenerateTemplateDataService).toHaveBeenCalledTimes(1);
         expect(result).toEqual([COMPLETED_NEW_RESOURCE]);
+    });
+
+    it("returns in-progress generation without polling when budget is exhausted after generation", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        let generated = false;
+        mockGenerateTemplateDataService.mockImplementation(async () => {
+            generated = true;
+            return NEW_RESOURCE;
+        });
+        mockSearchGeneratedResources.mockResolvedValue([COMPLETED_NEW_RESOURCE]);
+
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy.mockImplementation(() => (generated ? 46000 : 0));
+
+            const result = await downloadDataService(buildRequest());
+
+            expect(mockSearchGeneratedResources).not.toHaveBeenCalled();
+            expect(result).toEqual([NEW_RESOURCE]);
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("throws request-timeout when generation exceeds remaining request budget", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockImplementation(() => new Promise(() => { }));
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy
+                .mockReturnValueOnce(0)
+                .mockReturnValue(44999); // generation gets ~1ms budget
+
+            await expect(downloadDataService(buildRequest())).rejects.toMatchObject({
+                status: 504,
+                code: "REQUEST_TIMEOUT",
+            });
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("deterministically times out a never-resolving generation using fake timers", async () => {
+        jest.useFakeTimers();
+        jest.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockImplementation(() => new Promise(() => { }));
+
+        try {
+            const promise = downloadDataService(buildRequest());
+            const timeoutExpectation = expect(promise).rejects.toMatchObject({
+                status: 504,
+                code: "REQUEST_TIMEOUT",
+            });
+            await jest.advanceTimersByTimeAsync(45000);
+            await timeoutExpectation;
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it("throws request-timeout when request budget is already exhausted before validation", async () => {
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy
+                .mockReturnValueOnce(0) // request start
+                .mockReturnValue(46000); // budget exhausted before first bounded operation
+
+            await expect(downloadDataService(buildRequest())).rejects.toMatchObject({
+                status: 504,
+                code: "REQUEST_TIMEOUT",
+            });
+            expect(mockValidateDownloadRequest).not.toHaveBeenCalled();
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("logs polling deadline exhaustion based on actual post-poll deadline state", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        let firstPollReturned = false;
+        mockSearchGeneratedResources.mockImplementation(async () => {
+            firstPollReturned = true;
+            return [NEW_RESOURCE];
+        });
+
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy.mockImplementation(() => (firstPollReturned ? 46000 : 0));
+            await downloadDataService(buildRequest());
+            expect(mockLoggerWarn).toHaveBeenCalledWith(
+                expect.stringContaining("Polling ended at request deadline")
+            );
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("throws request-timeout when validation call exceeds remaining request budget", async () => {
+        mockValidateDownloadRequest.mockImplementation(() => new Promise(() => { }));
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy
+                .mockReturnValueOnce(0) // request start
+                .mockReturnValue(44990); // validation gets ~10ms of remaining budget
+
+            await expect(downloadDataService(buildRequest())).rejects.toMatchObject({
+                status: 504,
+                code: "REQUEST_TIMEOUT",
+            });
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("returns failed generated resource when polling reaches failed terminal status", async () => {
+        const failedResource = {
+            ...NEW_RESOURCE,
+            status: "failed",
+            fileStoreid: null,
+        };
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        mockSearchGeneratedResources.mockResolvedValue([failedResource]);
+
+        const result = await downloadDataService(buildRequest());
+
+        expect(mockSearchGeneratedResources).toHaveBeenCalledTimes(1);
+        expect(result).toEqual([failedResource]);
+    });
+
+    it("returns completed generated resource immediately on first polling attempt", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        mockSearchGeneratedResources.mockResolvedValue([COMPLETED_NEW_RESOURCE]);
+
+        const result = await downloadDataService(buildRequest());
+
+        expect(mockSearchGeneratedResources).toHaveBeenCalledTimes(1);
+        expect(result).toEqual([COMPLETED_NEW_RESOURCE]);
+    });
+
+    it("stops polling when remaining request budget elapses mid-loop", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        let firstPollReturned = false;
+        mockSearchGeneratedResources.mockImplementation(async () => {
+            firstPollReturned = true;
+            return [NEW_RESOURCE];
+        });
+
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy.mockImplementation(() => (firstPollReturned ? 46000 : 0));
+
+            const result = await downloadDataService(buildRequest());
+
+            expect(mockSearchGeneratedResources).toHaveBeenCalledTimes(1);
+            expect(result).toEqual([NEW_RESOURCE]);
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("returns in-progress resource when polling API call exceeds remaining budget", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        mockSearchGeneratedResources.mockImplementation(() => new Promise(() => { }));
+
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy
+                .mockReturnValueOnce(0) // request start
+                .mockReturnValue(44999); // remaining budget before polling is ~1ms
+
+            const result = await downloadDataService(buildRequest());
+
+            expect(mockSearchGeneratedResources).toHaveBeenCalledTimes(1);
+            expect(result).toEqual([NEW_RESOURCE]);
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("propagates polling search errors", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        mockSearchGeneratedResources.mockRejectedValue(new Error("search-failed"));
+
+        await expect(downloadDataService(buildRequest())).rejects.toThrow("search-failed");
+    });
+
+    it("keeps explicit-id semantics and does not invoke generation paths", async () => {
+        const explicit = { ...OLD_RESOURCE, additionalDetails: { localityCode: "loc-1" } };
+        mockSearchGeneratedResources.mockResolvedValue([explicit]);
+
+        const result = await downloadDataService(buildRequest({ query: { id: "old-gen-id", forceUpdate: "true" } }));
+
+        expect(mockGenerateTemplateDataService).not.toHaveBeenCalled();
+        expect(mockCallGenerate).not.toHaveBeenCalled();
+        expect(result).toEqual([explicit]);
+    });
+
+    it("returns empty list when explicit generated resource id is not found", async () => {
+        mockSearchGeneratedResources.mockResolvedValue([]);
+
+        const result = await downloadDataService(buildRequest({ query: { id: "missing-id" } }));
+
+        expect(result).toEqual([]);
+        expect(mockGenerateTemplateDataService).not.toHaveBeenCalled();
+        expect(mockCallGenerate).not.toHaveBeenCalled();
+    });
+
+    it("merges resource additionalDetails when explicit id is requested", async () => {
+        mockGetResourceDetails.mockResolvedValue({ additionalDetails: { localityCode: "loc-1", mergedKey: "merged-value" } });
+        const generated = {
+            ...OLD_RESOURCE,
+            additionalDetails: { existingKey: "existing-value" },
+        };
+        mockSearchGeneratedResources.mockResolvedValue([generated]);
+
+        const result = await downloadDataService(buildRequest({ query: { id: "old-gen-id" } }));
+
+        expect(mockSearchGeneratedResources).toHaveBeenCalledTimes(1);
+        expect(result?.[0]?.additionalDetails).toEqual({
+            existingKey: "existing-value",
+            localityCode: "loc-1",
+            mergedKey: "merged-value",
+        });
+    });
+
+    it("uses legacy generation when campaign is microplan even for sheet-manage types", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockIsCampaignIdOfMicroplan.mockResolvedValue(true);
+        const legacyGenerated = { ...COMPLETED_NEW_RESOURCE, id: "legacy-microplan-id", type: "attendanceRegisterUserBulkMapping" };
+        mockSearchGeneratedResources.mockResolvedValue([legacyGenerated]);
+
+        const result = await downloadDataService(buildRequest());
+
+        expect(mockCallGenerate).toHaveBeenCalledTimes(1);
+        expect(mockGenerateTemplateDataService).not.toHaveBeenCalled();
+        expect(result).toEqual([legacyGenerated]);
+    });
+
+    it("regenerates when no candidate matches requested locality for reusable type", async () => {
+        const otherLocalityCompleted = {
+            ...COMPLETED_NEW_RESOURCE,
+            id: "other-locality-completed",
+            type: "facilityWithBoundary",
+            additionalDetails: { localityCode: "other-loc" },
+            auditDetails: {
+                createdTime: Date.now() - 2000,
+                lastModifiedTime: Date.now() - 1000,
+                createdBy: "u",
+                lastModifiedBy: "u",
+            },
+        };
+        const newlyGenerated = { ...COMPLETED_NEW_RESOURCE, id: "newly-generated-facility", type: "facilityWithBoundary" };
+        mockSearchAllGeneratedResources.mockResolvedValue([otherLocalityCompleted]);
+        mockSearchGeneratedResources.mockResolvedValue([newlyGenerated]);
+
+        const result = await downloadDataService(buildRequest({ query: { type: "facilityWithBoundary", localityCode: "loc-1" } }));
+
+        expect(mockCallGenerate).toHaveBeenCalledTimes(1);
+        expect(result).toEqual([newlyGenerated]);
+    });
+
+    it("deterministically picks first matching candidate when timestamps are missing", async () => {
+        const firstInProgress = {
+            id: "first-inprogress-no-time",
+            status: "inprogress",
+            type: "facilityWithBoundary",
+            fileStoreid: null,
+            additionalDetails: { localityCode: "loc-1" },
+            auditDetails: { createdBy: "u", lastModifiedBy: "u" },
+        };
+        const secondInProgress = {
+            ...firstInProgress,
+            id: "second-inprogress-no-time",
+        };
+        const completedFirst = {
+            ...COMPLETED_NEW_RESOURCE,
+            id: firstInProgress.id,
+            type: "facilityWithBoundary",
+            additionalDetails: { localityCode: "loc-1" },
+        };
+        mockSearchAllGeneratedResources.mockResolvedValue([firstInProgress, secondInProgress]);
+        mockSearchGeneratedResources.mockImplementation(async (query: any) => {
+            if (query?.id === firstInProgress.id) return [completedFirst];
+            return [{ ...COMPLETED_NEW_RESOURCE, id: query?.id, type: "facilityWithBoundary" }];
+        });
+
+        const result = await downloadDataService(buildRequest({ query: { type: "facilityWithBoundary" } }));
+
+        expect(mockCallGenerate).not.toHaveBeenCalled();
+        expect(mockSearchGeneratedResources).toHaveBeenCalledWith(
+            expect.objectContaining({ id: firstInProgress.id }),
+            "en_BEDNET"
+        );
+        expect(result).toEqual([completedFirst]);
+    });
+
+    it("fails request when resource details lookup fails", async () => {
+        mockGetResourceDetails.mockRejectedValue(new Error("resource-details-failed"));
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+
+        await expect(downloadDataService(buildRequest())).rejects.toThrow("resource-details-failed");
+    });
+
+    it("returns completed resource when it arrives exactly at deadline-bound polling", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        mockSearchGeneratedResources.mockResolvedValue([COMPLETED_NEW_RESOURCE]);
+
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy
+                .mockReturnValueOnce(0) // request start
+                .mockReturnValue(44999); // remaining budget before polling is ~1ms
+
+            const result = await downloadDataService(buildRequest());
+
+            expect(result).toEqual([COMPLETED_NEW_RESOURCE]);
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("throws internal server error when microplan check fails", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockIsCampaignIdOfMicroplan.mockRejectedValue(new Error("microplan-check-failed"));
+
+        await expect(downloadDataService(buildRequest({ query: { type: "facilityWithBoundary" } }))).rejects.toMatchObject({
+            status: 500,
+            code: "INTERNAL_SERVER_ERROR",
+        });
+        expect(mockCallGenerate).not.toHaveBeenCalled();
+        expect(mockGenerateTemplateDataService).not.toHaveBeenCalled();
     });
 });

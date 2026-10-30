@@ -35,6 +35,7 @@ const sheetManageGenerationTypes = new Set<string>(
 
 const downloadGeneratedStatusPollIntervalMs = 1000;
 const downloadGeneratedStatusPollMaxAttempts = 45;
+const downloadResponseTimeBudgetMs = 45 * 1000;
 const staleInProgressResourceThresholdMs = 5 * 60 * 1000;
 const ALWAYS_FRESH_DOWNLOAD_TYPES = new Set<string>([
     "attendanceRegisterUserBulkMapping"
@@ -86,25 +87,136 @@ function isReusableCompletedResource(resource: any): boolean {
 }
 
 function newestForLocality(resources: any[], localityKey: string | null): any {
-    return (Array.isArray(resources) ? resources : [])
-        .filter((resource) => localityKeyOf(resource) === localityKey)
-        .sort((a, b) => toEpoch(b?.auditDetails?.createdTime) - toEpoch(a?.auditDetails?.createdTime))[0];
+    if (!Array.isArray(resources) || resources.length === 0) return undefined;
+    let fallback: any = undefined;
+    let newest: any = undefined;
+    let newestCreatedTime = Number.NEGATIVE_INFINITY;
+
+    for (const resource of resources) {
+        if (localityKeyOf(resource) !== localityKey) continue;
+        if (!fallback) fallback = resource;
+        const createdTime = toEpoch(resource?.auditDetails?.createdTime);
+        if (!Number.isFinite(createdTime)) continue;
+        if (createdTime > newestCreatedTime) {
+            newest = resource;
+            newestCreatedTime = createdTime;
+        }
+    }
+
+    return newest ?? fallback;
 }
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getRemainingTimeMs(deadlineEpochMs: number): number {
+    return Math.max(0, deadlineEpochMs - Date.now());
+}
+
+function createRequestTimeoutError(operationName: string): any {
+    const description = `Request timed out while ${operationName}`;
+    const error: any = new Error(description);
+    error.status = 504;
+    error.code = "REQUEST_TIMEOUT";
+    error.description = description;
+    return error;
+}
+
+async function runWithinRequestBudget<T>(
+    operationName: string,
+    deadlineEpochMs: number,
+    operation: () => Promise<T>
+): Promise<T> {
+    const remainingTimeMs = getRemainingTimeMs(deadlineEpochMs);
+    if (remainingTimeMs <= 0) {
+        throw createRequestTimeoutError(operationName);
+    }
+
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    // This bounds caller wait-time; it does not abort the underlying operation unless the downstream client supports cancellation.
+    // Retries therefore must remain idempotent and tolerate late completion of timed-out downstream calls.
+    const timeoutPromise = new Promise<T>((_resolve, reject) => {
+        timeoutHandle = setTimeout(() => reject(createRequestTimeoutError(operationName)), remainingTimeMs);
+    });
+
+    try {
+        return await Promise.race([operation(), timeoutPromise]);
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+}
+
+async function waitForWithinRequestBudget<T>(
+    operationName: string,
+    deadlineEpochMs: number,
+    promise: Promise<T>
+): Promise<T> {
+    const remainingTimeMs = getRemainingTimeMs(deadlineEpochMs);
+    if (remainingTimeMs <= 0) {
+        throw createRequestTimeoutError(operationName);
+    }
+
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<T>((_resolve, reject) => {
+        timeoutHandle = setTimeout(() => reject(createRequestTimeoutError(operationName)), remainingTimeMs);
+    });
+
+    try {
+        return await Promise.race([promise, timeoutPromise]);
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+}
+
+async function searchGeneratedResourcesWithinDeadline(
+    requestQuery: any,
+    locale: string,
+    deadlineEpochMs: number
+): Promise<any[] | null> {
+    const remainingTimeMs = getRemainingTimeMs(deadlineEpochMs);
+    if (remainingTimeMs <= 0) return null;
+
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<null>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(null), remainingTimeMs);
+    });
+
+    try {
+        const result = await Promise.race([
+            searchGeneratedResources(requestQuery, locale),
+            timeoutPromise
+        ]);
+        return result as any[] | null;
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+}
+
 async function waitForGeneratedResourceTerminalStatus(
     requestQuery: any,
     locale: string,
-    generatedResourceId: string
+    generatedResourceId: string,
+    maxWaitMs: number
 ): Promise<any | null> {
-    for (let attempt = 0; attempt < downloadGeneratedStatusPollMaxAttempts; attempt++) {
-        const generatedResources = await searchGeneratedResources(
+    if (maxWaitMs <= 0) return null;
+
+    const pollDeadline = Date.now() + maxWaitMs;
+    const maxAttempts = Math.min(
+        downloadGeneratedStatusPollMaxAttempts,
+        Math.max(1, Math.ceil(maxWaitMs / downloadGeneratedStatusPollIntervalMs))
+    );
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const generatedResources = await searchGeneratedResourcesWithinDeadline(
             { ...requestQuery, id: generatedResourceId },
-            locale
+            locale,
+            pollDeadline
         );
+        if (generatedResources === null) {
+            logger.warn(`Stopping generation polling for id=${generatedResourceId}: polling budget exhausted.`);
+            return null;
+        }
         const generatedResource = generatedResources?.[0];
         const status = generatedResource?.status;
 
@@ -112,8 +224,10 @@ async function waitForGeneratedResourceTerminalStatus(
             return generatedResource;
         }
 
-        if (attempt < downloadGeneratedStatusPollMaxAttempts - 1) {
-            await sleep(downloadGeneratedStatusPollIntervalMs);
+        if (attempt < maxAttempts - 1) {
+            const remainingMs = pollDeadline - Date.now();
+            if (remainingMs <= 0) break;
+            await sleep(Math.min(downloadGeneratedStatusPollIntervalMs, remainingMs));
         }
     }
     return null;
@@ -121,14 +235,24 @@ async function waitForGeneratedResourceTerminalStatus(
 
 
 const downloadDataService = async (request: express.Request) => {
-    await validateDownloadRequest(request);
+    const requestDeadline = Date.now() + downloadResponseTimeBudgetMs;
+    await runWithinRequestBudget(
+        "validating download request",
+        requestDeadline,
+        async () => validateDownloadRequest(request)
+    );
     logger.info("VALIDATED THE DATA DOWNLOAD REQUEST");
 
     const type = String(request.query.type);
     const locale = getLocaleFromRequestInfo(request?.body?.RequestInfo);
     const hasRequestedGeneratedId = Boolean(request?.query?.id);
-    let responseData = hasRequestedGeneratedId ? await searchGeneratedResources(request?.query, locale) : [];
-    const resourceDetails = await getResourceDetails(request);
+    const resourceDetailsPromise = runWithinRequestBudget(
+        "loading resource details",
+        requestDeadline,
+        async () => getResourceDetails(request)
+    );
+    let responseData: any[] | null = [];
+    let resourceDetails: any = null;
     const tenantId = String(request?.query?.tenantId || "");
     const hierarchyType = String(request?.query?.hierarchyType || "");
     const campaignId = String(request?.query?.campaignId || "");
@@ -139,16 +263,24 @@ const downloadDataService = async (request: express.Request) => {
 
     if (!hasRequestedGeneratedId) {
         const requestLocalityKey = localityKeyOf({ additionalDetails: { localityCode } });
-        const candidates = await searchAllGeneratedResources(
-            {
-                tenantId,
-                type,
-                hierarchyType,
-                campaignId,
-                status: `${generatedResourceStatuses.completed},${generatedResourceStatuses.inprogress}`
-            },
-            locale
-        );
+        const [resolvedResourceDetails, candidates] = await Promise.all([
+            waitForWithinRequestBudget("loading resource details", requestDeadline, resourceDetailsPromise),
+            runWithinRequestBudget(
+                "searching generated resources",
+                requestDeadline,
+                async () => searchAllGeneratedResources(
+                    {
+                        tenantId,
+                        type,
+                        hierarchyType,
+                        campaignId,
+                        status: `${generatedResourceStatuses.completed},${generatedResourceStatuses.inprogress}`
+                    },
+                    locale
+                )
+            )
+        ]);
+        resourceDetails = resolvedResourceDetails;
         const latestResource = newestForLocality(candidates || [], requestLocalityKey);
         const hasFreshInProgressResource =
             !shouldBypassReuse
@@ -177,8 +309,15 @@ const downloadDataService = async (request: express.Request) => {
 
             let isMicroplan = false;
             try {
-                isMicroplan = await isCampaignIdOfMicroplan(tenantId, campaignId);
-            } catch (e) {
+                isMicroplan = await runWithinRequestBudget(
+                    "checking campaign microplan status",
+                    requestDeadline,
+                    async () => isCampaignIdOfMicroplan(tenantId, campaignId)
+                );
+            } catch (e: any) {
+                if (e?.code === "REQUEST_TIMEOUT") {
+                    throw e;
+                }
                 throwError("COMMON", 500, "INTERNAL_SERVER_ERROR", "Error checking if campaign id is of microplan");
             }
 
@@ -190,11 +329,15 @@ const downloadDataService = async (request: express.Request) => {
                     campaignId,
                     ...(localityCode ? { localityCode } : {}),
                 };
-                const generatedResource = await generateTemplateDataService(
-                    generateTemplateQuery,
-                    userUuid,
-                    locale,
-                    request?.body?.RequestInfo
+                const generatedResource = await runWithinRequestBudget(
+                    "generating download template",
+                    requestDeadline,
+                    async () => generateTemplateDataService(
+                        generateTemplateQuery,
+                        userUuid,
+                        locale,
+                        request?.body?.RequestInfo
+                    )
                 );
                 responseData = generatedResource ? [generatedResource] : [];
             } else {
@@ -210,22 +353,49 @@ const downloadDataService = async (request: express.Request) => {
                         forceUpdate: 'true'
                     }
                 };
-                await callGenerate(newRequestToGenerate, type);
+                await runWithinRequestBudget(
+                    "triggering legacy template generation",
+                    requestDeadline,
+                    async () => callGenerate(newRequestToGenerate, type)
+                );
                 if (Array.isArray(newRequestToGenerate?.body?.generatedResource) && newRequestToGenerate.body.generatedResource.length > 0) {
                     responseData = newRequestToGenerate.body.generatedResource;
                 } else {
-                    responseData = await searchGeneratedResources(newRequestToGenerate?.query, locale);
+                    responseData = await runWithinRequestBudget(
+                        "searching generated resources",
+                        requestDeadline,
+                        async () => searchGeneratedResources(newRequestToGenerate?.query, locale)
+                    );
                 }
             }
         }
 
         const generatedResourceId = responseData?.[0]?.id;
         if (generatedResourceId && responseData?.[0]?.status === generatedResourceStatuses.inprogress) {
-            const terminalResource = await waitForGeneratedResourceTerminalStatus(request?.query, locale, generatedResourceId);
+            const remainingBudgetMs = getRemainingTimeMs(requestDeadline);
+            const terminalResource = await waitForGeneratedResourceTerminalStatus(
+                request?.query,
+                locale,
+                generatedResourceId,
+                remainingBudgetMs
+            );
             if (terminalResource) {
                 responseData = [terminalResource];
+            } else if (getRemainingTimeMs(requestDeadline) <= 0) {
+                logger.warn(`Polling ended at request deadline for generation id=${generatedResourceId}. Returning current in-progress resource.`);
             }
         }
+    } else {
+        const [generatedResources, resolvedResourceDetails] = await Promise.all([
+            runWithinRequestBudget(
+                "searching generated resources",
+                requestDeadline,
+                async () => searchGeneratedResources(request?.query, locale)
+            ),
+            waitForWithinRequestBudget("loading resource details", requestDeadline, resourceDetailsPromise)
+        ]);
+        responseData = generatedResources;
+        resourceDetails = resolvedResourceDetails;
     }
 
     if (resourceDetails != null && responseData != null && responseData.length > 0) {
