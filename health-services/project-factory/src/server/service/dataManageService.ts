@@ -114,6 +114,30 @@ function getRemainingTimeMs(deadlineEpochMs: number): number {
     return Math.max(0, deadlineEpochMs - Date.now());
 }
 
+async function searchGeneratedResourcesWithinDeadline(
+    requestQuery: any,
+    locale: string,
+    deadlineEpochMs: number
+): Promise<any[] | null> {
+    const remainingTimeMs = getRemainingTimeMs(deadlineEpochMs);
+    if (remainingTimeMs <= 0) return null;
+
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<null>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(null), remainingTimeMs);
+    });
+
+    try {
+        const result = await Promise.race([
+            searchGeneratedResources(requestQuery, locale),
+            timeoutPromise
+        ]);
+        return result as any[] | null;
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+}
+
 async function waitForGeneratedResourceTerminalStatus(
     requestQuery: any,
     locale: string,
@@ -129,10 +153,15 @@ async function waitForGeneratedResourceTerminalStatus(
     );
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const generatedResources = await searchGeneratedResources(
+        const generatedResources = await searchGeneratedResourcesWithinDeadline(
             { ...requestQuery, id: generatedResourceId },
-            locale
+            locale,
+            pollDeadline
         );
+        if (generatedResources === null) {
+            logger.warn(`Stopping generation polling for id=${generatedResourceId}: polling budget exhausted.`);
+            return null;
+        }
         const generatedResource = generatedResources?.[0];
         const status = generatedResource?.status;
 
