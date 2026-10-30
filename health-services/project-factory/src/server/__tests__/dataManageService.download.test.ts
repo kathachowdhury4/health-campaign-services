@@ -366,21 +366,57 @@ describe("downloadDataService always-fresh behavior", () => {
         expect(result).toEqual([COMPLETED_NEW_RESOURCE]);
     });
 
-    it("returns in-progress generation without polling when 45-second budget is exhausted", async () => {
+    it("returns in-progress generation without polling when budget is exhausted after generation", async () => {
         mockSearchAllGeneratedResources.mockResolvedValue([]);
-        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        let generated = false;
+        mockGenerateTemplateDataService.mockImplementation(async () => {
+            generated = true;
+            return NEW_RESOURCE;
+        });
         mockSearchGeneratedResources.mockResolvedValue([COMPLETED_NEW_RESOURCE]);
 
         const dateNowSpy = jest.spyOn(Date, "now");
         try {
-            dateNowSpy
-                .mockReturnValueOnce(0) // request start
-                .mockReturnValue(46000); // subsequent calls see no remaining budget
+            dateNowSpy.mockImplementation(() => (generated ? 46000 : 0));
 
             const result = await downloadDataService(buildRequest());
 
             expect(mockSearchGeneratedResources).not.toHaveBeenCalled();
             expect(result).toEqual([NEW_RESOURCE]);
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("throws request-timeout when request budget is already exhausted before validation", async () => {
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy
+                .mockReturnValueOnce(0) // request start
+                .mockReturnValue(46000); // budget exhausted before first bounded operation
+
+            await expect(downloadDataService(buildRequest())).rejects.toMatchObject({
+                status: 504,
+                code: "REQUEST_TIMEOUT",
+            });
+            expect(mockValidateDownloadRequest).not.toHaveBeenCalled();
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("throws request-timeout when validation call exceeds remaining request budget", async () => {
+        mockValidateDownloadRequest.mockImplementation(() => new Promise(() => { }));
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy
+                .mockReturnValueOnce(0) // request start
+                .mockReturnValue(44990); // validation gets ~10ms of remaining budget
+
+            await expect(downloadDataService(buildRequest())).rejects.toMatchObject({
+                status: 504,
+                code: "REQUEST_TIMEOUT",
+            });
         } finally {
             dateNowSpy.mockRestore();
         }
@@ -416,16 +452,15 @@ describe("downloadDataService always-fresh behavior", () => {
     it("stops polling when remaining request budget elapses mid-loop", async () => {
         mockSearchAllGeneratedResources.mockResolvedValue([]);
         mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
-        mockSearchGeneratedResources.mockResolvedValue([NEW_RESOURCE]);
+        let firstPollReturned = false;
+        mockSearchGeneratedResources.mockImplementation(async () => {
+            firstPollReturned = true;
+            return [NEW_RESOURCE];
+        });
 
         const dateNowSpy = jest.spyOn(Date, "now");
         try {
-            dateNowSpy
-                .mockReturnValueOnce(0) // request start
-                .mockReturnValueOnce(44500) // remaining budget before polling: 500ms
-                .mockReturnValueOnce(44500) // polling deadline base time
-                .mockReturnValueOnce(44999) // first poll request still within deadline
-                .mockReturnValue(45010); // elapsed beyond polling deadline after first attempt
+            dateNowSpy.mockImplementation(() => (firstPollReturned ? 46000 : 0));
 
             const result = await downloadDataService(buildRequest());
 

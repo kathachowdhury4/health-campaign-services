@@ -114,6 +114,60 @@ function getRemainingTimeMs(deadlineEpochMs: number): number {
     return Math.max(0, deadlineEpochMs - Date.now());
 }
 
+function createRequestTimeoutError(operationName: string): any {
+    const description = `Request timed out while ${operationName}`;
+    const error: any = new Error(description);
+    error.status = 504;
+    error.code = "REQUEST_TIMEOUT";
+    error.description = description;
+    return error;
+}
+
+async function runWithinRequestBudget<T>(
+    operationName: string,
+    deadlineEpochMs: number,
+    operation: () => Promise<T>
+): Promise<T> {
+    const remainingTimeMs = getRemainingTimeMs(deadlineEpochMs);
+    if (remainingTimeMs <= 0) {
+        throw createRequestTimeoutError(operationName);
+    }
+
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    // This bounds caller wait-time; it does not abort the underlying operation unless the downstream client supports cancellation.
+    const timeoutPromise = new Promise<T>((_resolve, reject) => {
+        timeoutHandle = setTimeout(() => reject(createRequestTimeoutError(operationName)), remainingTimeMs);
+    });
+
+    try {
+        return await Promise.race([operation(), timeoutPromise]);
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+}
+
+async function waitForWithinRequestBudget<T>(
+    operationName: string,
+    deadlineEpochMs: number,
+    promise: Promise<T>
+): Promise<T> {
+    const remainingTimeMs = getRemainingTimeMs(deadlineEpochMs);
+    if (remainingTimeMs <= 0) {
+        throw createRequestTimeoutError(operationName);
+    }
+
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<T>((_resolve, reject) => {
+        timeoutHandle = setTimeout(() => reject(createRequestTimeoutError(operationName)), remainingTimeMs);
+    });
+
+    try {
+        return await Promise.race([promise, timeoutPromise]);
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+}
+
 async function searchGeneratedResourcesWithinDeadline(
     requestQuery: any,
     locale: string,
@@ -181,13 +235,21 @@ async function waitForGeneratedResourceTerminalStatus(
 
 const downloadDataService = async (request: express.Request) => {
     const requestDeadline = Date.now() + downloadResponseTimeBudgetMs;
-    await validateDownloadRequest(request);
+    await runWithinRequestBudget(
+        "validating download request",
+        requestDeadline,
+        async () => validateDownloadRequest(request)
+    );
     logger.info("VALIDATED THE DATA DOWNLOAD REQUEST");
 
     const type = String(request.query.type);
     const locale = getLocaleFromRequestInfo(request?.body?.RequestInfo);
     const hasRequestedGeneratedId = Boolean(request?.query?.id);
-    const resourceDetailsPromise = getResourceDetails(request);
+    const resourceDetailsPromise = runWithinRequestBudget(
+        "loading resource details",
+        requestDeadline,
+        async () => getResourceDetails(request)
+    );
     let responseData: any[] | null = [];
     let resourceDetails: any = null;
     const tenantId = String(request?.query?.tenantId || "");
@@ -201,16 +263,20 @@ const downloadDataService = async (request: express.Request) => {
     if (!hasRequestedGeneratedId) {
         const requestLocalityKey = localityKeyOf({ additionalDetails: { localityCode } });
         const [resolvedResourceDetails, candidates] = await Promise.all([
-            resourceDetailsPromise,
-            searchAllGeneratedResources(
-                {
-                    tenantId,
-                    type,
-                    hierarchyType,
-                    campaignId,
-                    status: `${generatedResourceStatuses.completed},${generatedResourceStatuses.inprogress}`
-                },
-                locale
+            waitForWithinRequestBudget("loading resource details", requestDeadline, resourceDetailsPromise),
+            runWithinRequestBudget(
+                "searching generated resources",
+                requestDeadline,
+                async () => searchAllGeneratedResources(
+                    {
+                        tenantId,
+                        type,
+                        hierarchyType,
+                        campaignId,
+                        status: `${generatedResourceStatuses.completed},${generatedResourceStatuses.inprogress}`
+                    },
+                    locale
+                )
             )
         ]);
         resourceDetails = resolvedResourceDetails;
@@ -242,8 +308,15 @@ const downloadDataService = async (request: express.Request) => {
 
             let isMicroplan = false;
             try {
-                isMicroplan = await isCampaignIdOfMicroplan(tenantId, campaignId);
-            } catch (e) {
+                isMicroplan = await runWithinRequestBudget(
+                    "checking campaign microplan status",
+                    requestDeadline,
+                    async () => isCampaignIdOfMicroplan(tenantId, campaignId)
+                );
+            } catch (e: any) {
+                if (e?.code === "REQUEST_TIMEOUT") {
+                    throw e;
+                }
                 throwError("COMMON", 500, "INTERNAL_SERVER_ERROR", "Error checking if campaign id is of microplan");
             }
 
@@ -255,11 +328,15 @@ const downloadDataService = async (request: express.Request) => {
                     campaignId,
                     ...(localityCode ? { localityCode } : {}),
                 };
-                const generatedResource = await generateTemplateDataService(
-                    generateTemplateQuery,
-                    userUuid,
-                    locale,
-                    request?.body?.RequestInfo
+                const generatedResource = await runWithinRequestBudget(
+                    "generating download template",
+                    requestDeadline,
+                    async () => generateTemplateDataService(
+                        generateTemplateQuery,
+                        userUuid,
+                        locale,
+                        request?.body?.RequestInfo
+                    )
                 );
                 responseData = generatedResource ? [generatedResource] : [];
             } else {
@@ -275,11 +352,19 @@ const downloadDataService = async (request: express.Request) => {
                         forceUpdate: 'true'
                     }
                 };
-                await callGenerate(newRequestToGenerate, type);
+                await runWithinRequestBudget(
+                    "triggering legacy template generation",
+                    requestDeadline,
+                    async () => callGenerate(newRequestToGenerate, type)
+                );
                 if (Array.isArray(newRequestToGenerate?.body?.generatedResource) && newRequestToGenerate.body.generatedResource.length > 0) {
                     responseData = newRequestToGenerate.body.generatedResource;
                 } else {
-                    responseData = await searchGeneratedResources(newRequestToGenerate?.query, locale);
+                    responseData = await runWithinRequestBudget(
+                        "searching generated resources",
+                        requestDeadline,
+                        async () => searchGeneratedResources(newRequestToGenerate?.query, locale)
+                    );
                 }
             }
         }
@@ -301,8 +386,12 @@ const downloadDataService = async (request: express.Request) => {
         }
     } else {
         const [generatedResources, resolvedResourceDetails] = await Promise.all([
-            searchGeneratedResources(request?.query, locale),
-            resourceDetailsPromise
+            runWithinRequestBudget(
+                "searching generated resources",
+                requestDeadline,
+                async () => searchGeneratedResources(request?.query, locale)
+            ),
+            waitForWithinRequestBudget("loading resource details", requestDeadline, resourceDetailsPromise)
         ]);
         responseData = generatedResources;
         resourceDetails = resolvedResourceDetails;
