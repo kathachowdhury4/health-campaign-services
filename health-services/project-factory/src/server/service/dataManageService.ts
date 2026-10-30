@@ -35,6 +35,7 @@ const sheetManageGenerationTypes = new Set<string>(
 
 const downloadGeneratedStatusPollIntervalMs = 1000;
 const downloadGeneratedStatusPollMaxAttempts = 45;
+const downloadResponseTimeBudgetMs = 45 * 1000;
 const staleInProgressResourceThresholdMs = 5 * 60 * 1000;
 const ALWAYS_FRESH_DOWNLOAD_TYPES = new Set<string>([
     "attendanceRegisterUserBulkMapping"
@@ -86,21 +87,48 @@ function isReusableCompletedResource(resource: any): boolean {
 }
 
 function newestForLocality(resources: any[], localityKey: string | null): any {
-    return (Array.isArray(resources) ? resources : [])
-        .filter((resource) => localityKeyOf(resource) === localityKey)
-        .sort((a, b) => toEpoch(b?.auditDetails?.createdTime) - toEpoch(a?.auditDetails?.createdTime))[0];
+    if (!Array.isArray(resources) || resources.length === 0) return undefined;
+    let fallback: any = undefined;
+    let newest: any = undefined;
+    let newestCreatedTime = Number.NEGATIVE_INFINITY;
+
+    for (const resource of resources) {
+        if (localityKeyOf(resource) !== localityKey) continue;
+        if (!fallback) fallback = resource;
+        const createdTime = toEpoch(resource?.auditDetails?.createdTime);
+        if (!Number.isFinite(createdTime)) continue;
+        if (createdTime > newestCreatedTime) {
+            newest = resource;
+            newestCreatedTime = createdTime;
+        }
+    }
+
+    return newest ?? fallback;
 }
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getRemainingTimeMs(deadlineEpochMs: number): number {
+    return Math.max(0, deadlineEpochMs - Date.now());
+}
+
 async function waitForGeneratedResourceTerminalStatus(
     requestQuery: any,
     locale: string,
-    generatedResourceId: string
+    generatedResourceId: string,
+    maxWaitMs: number
 ): Promise<any | null> {
-    for (let attempt = 0; attempt < downloadGeneratedStatusPollMaxAttempts; attempt++) {
+    if (maxWaitMs <= 0) return null;
+
+    const pollDeadline = Date.now() + maxWaitMs;
+    const maxAttempts = Math.min(
+        downloadGeneratedStatusPollMaxAttempts,
+        Math.max(1, Math.ceil(maxWaitMs / downloadGeneratedStatusPollIntervalMs))
+    );
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const generatedResources = await searchGeneratedResources(
             { ...requestQuery, id: generatedResourceId },
             locale
@@ -112,8 +140,10 @@ async function waitForGeneratedResourceTerminalStatus(
             return generatedResource;
         }
 
-        if (attempt < downloadGeneratedStatusPollMaxAttempts - 1) {
-            await sleep(downloadGeneratedStatusPollIntervalMs);
+        if (attempt < maxAttempts - 1) {
+            const remainingMs = pollDeadline - Date.now();
+            if (remainingMs <= 0) break;
+            await sleep(Math.min(downloadGeneratedStatusPollIntervalMs, remainingMs));
         }
     }
     return null;
@@ -121,14 +151,16 @@ async function waitForGeneratedResourceTerminalStatus(
 
 
 const downloadDataService = async (request: express.Request) => {
+    const requestDeadline = Date.now() + downloadResponseTimeBudgetMs;
     await validateDownloadRequest(request);
     logger.info("VALIDATED THE DATA DOWNLOAD REQUEST");
 
     const type = String(request.query.type);
     const locale = getLocaleFromRequestInfo(request?.body?.RequestInfo);
     const hasRequestedGeneratedId = Boolean(request?.query?.id);
-    let responseData = hasRequestedGeneratedId ? await searchGeneratedResources(request?.query, locale) : [];
-    const resourceDetails = await getResourceDetails(request);
+    const resourceDetailsPromise = getResourceDetails(request);
+    let responseData: any[] | null = [];
+    let resourceDetails: any = null;
     const tenantId = String(request?.query?.tenantId || "");
     const hierarchyType = String(request?.query?.hierarchyType || "");
     const campaignId = String(request?.query?.campaignId || "");
@@ -139,16 +171,20 @@ const downloadDataService = async (request: express.Request) => {
 
     if (!hasRequestedGeneratedId) {
         const requestLocalityKey = localityKeyOf({ additionalDetails: { localityCode } });
-        const candidates = await searchAllGeneratedResources(
-            {
-                tenantId,
-                type,
-                hierarchyType,
-                campaignId,
-                status: `${generatedResourceStatuses.completed},${generatedResourceStatuses.inprogress}`
-            },
-            locale
-        );
+        const [resolvedResourceDetails, candidates] = await Promise.all([
+            resourceDetailsPromise,
+            searchAllGeneratedResources(
+                {
+                    tenantId,
+                    type,
+                    hierarchyType,
+                    campaignId,
+                    status: `${generatedResourceStatuses.completed},${generatedResourceStatuses.inprogress}`
+                },
+                locale
+            )
+        ]);
+        resourceDetails = resolvedResourceDetails;
         const latestResource = newestForLocality(candidates || [], requestLocalityKey);
         const hasFreshInProgressResource =
             !shouldBypassReuse
@@ -221,11 +257,26 @@ const downloadDataService = async (request: express.Request) => {
 
         const generatedResourceId = responseData?.[0]?.id;
         if (generatedResourceId && responseData?.[0]?.status === generatedResourceStatuses.inprogress) {
-            const terminalResource = await waitForGeneratedResourceTerminalStatus(request?.query, locale, generatedResourceId);
+            const remainingBudgetMs = getRemainingTimeMs(requestDeadline);
+            const terminalResource = await waitForGeneratedResourceTerminalStatus(
+                request?.query,
+                locale,
+                generatedResourceId,
+                remainingBudgetMs
+            );
             if (terminalResource) {
                 responseData = [terminalResource];
+            } else if (remainingBudgetMs <= 0) {
+                logger.warn(`Skipping terminal-status wait for generation id=${generatedResourceId}: request budget exhausted.`);
             }
         }
+    } else {
+        const [generatedResources, resolvedResourceDetails] = await Promise.all([
+            searchGeneratedResources(request?.query, locale),
+            resourceDetailsPromise
+        ]);
+        responseData = generatedResources;
+        resourceDetails = resolvedResourceDetails;
     }
 
     if (resourceDetails != null && responseData != null && responseData.length > 0) {

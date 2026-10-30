@@ -26,6 +26,7 @@ POST /v1/data/_download    // Download generated Excel
 - ✅ Basic Excel generation
 - ✅ Simple validation
 - ✅ Direct processing without configuration files
+- ✅ Download path now parallelizes independent lookups and bounds synchronous wait time to a 45s request budget
 - ❌ No class-based generation
 - ❌ Limited customization options
 
