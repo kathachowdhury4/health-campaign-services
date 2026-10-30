@@ -380,8 +380,8 @@ const downloadDataService = async (request: express.Request) => {
             );
             if (terminalResource) {
                 responseData = [terminalResource];
-            } else if (remainingBudgetMs <= 0) {
-                logger.warn(`Skipping terminal-status wait for generation id=${generatedResourceId}: request budget exhausted.`);
+            } else if (getRemainingTimeMs(requestDeadline) <= 0) {
+                logger.warn(`Polling ended at request deadline for generation id=${generatedResourceId}. Returning current in-progress resource.`);
             }
         }
     } else {

@@ -97,6 +97,7 @@ import { validateDownloadRequest } from "../validators/campaignValidators";
 import { generateDataService as generateTemplateDataService } from "../service/sheetManageService";
 import { callGenerate } from "../utils/generateUtils";
 import { getResourceDetails, isCampaignIdOfMicroplan } from "../utils/campaignUtils";
+import { logger } from "../utils/logger";
 
 const mockSearchGeneratedResources = searchGeneratedResources as jest.Mock;
 const mockSearchAllGeneratedResources = searchAllGeneratedResources as jest.Mock;
@@ -105,6 +106,7 @@ const mockGenerateTemplateDataService = generateTemplateDataService as jest.Mock
 const mockCallGenerate = callGenerate as jest.Mock;
 const mockGetResourceDetails = getResourceDetails as jest.Mock;
 const mockIsCampaignIdOfMicroplan = isCampaignIdOfMicroplan as jest.Mock;
+const mockLoggerWarn = logger.warn as jest.Mock;
 
 const OLD_RESOURCE = {
     id: "old-gen-id",
@@ -185,6 +187,19 @@ describe("downloadDataService always-fresh behavior", () => {
         );
         expect(result).toEqual([COMPLETED_NEW_RESOURCE]);
         expect(mockCallGenerate).not.toHaveBeenCalled();
+    });
+
+    it("invokes validation and key lookups only once in fresh-generation path", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        mockSearchGeneratedResources.mockResolvedValue([COMPLETED_NEW_RESOURCE]);
+
+        await downloadDataService(buildRequest());
+
+        expect(mockValidateDownloadRequest).toHaveBeenCalledTimes(1);
+        expect(mockGetResourceDetails).toHaveBeenCalledTimes(1);
+        expect(mockSearchAllGeneratedResources).toHaveBeenCalledTimes(1);
+        expect(mockGenerateTemplateDataService).toHaveBeenCalledTimes(1);
     });
 
     it("does not regenerate when explicit generated resource id is provided", async () => {
@@ -388,6 +403,24 @@ describe("downloadDataService always-fresh behavior", () => {
         }
     });
 
+    it("throws request-timeout when generation exceeds remaining request budget", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockImplementation(() => new Promise(() => { }));
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy
+                .mockReturnValueOnce(0)
+                .mockReturnValue(44999); // generation gets ~1ms budget
+
+            await expect(downloadDataService(buildRequest())).rejects.toMatchObject({
+                status: 504,
+                code: "REQUEST_TIMEOUT",
+            });
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
     it("throws request-timeout when request budget is already exhausted before validation", async () => {
         const dateNowSpy = jest.spyOn(Date, "now");
         try {
@@ -400,6 +433,27 @@ describe("downloadDataService always-fresh behavior", () => {
                 code: "REQUEST_TIMEOUT",
             });
             expect(mockValidateDownloadRequest).not.toHaveBeenCalled();
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it("logs polling deadline exhaustion based on actual post-poll deadline state", async () => {
+        mockSearchAllGeneratedResources.mockResolvedValue([]);
+        mockGenerateTemplateDataService.mockResolvedValue(NEW_RESOURCE);
+        let firstPollReturned = false;
+        mockSearchGeneratedResources.mockImplementation(async () => {
+            firstPollReturned = true;
+            return [NEW_RESOURCE];
+        });
+
+        const dateNowSpy = jest.spyOn(Date, "now");
+        try {
+            dateNowSpy.mockImplementation(() => (firstPollReturned ? 46000 : 0));
+            await downloadDataService(buildRequest());
+            expect(mockLoggerWarn).toHaveBeenCalledWith(
+                expect.stringContaining("Polling ended at request deadline")
+            );
         } finally {
             dateNowSpy.mockRestore();
         }
